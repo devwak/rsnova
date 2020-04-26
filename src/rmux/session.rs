@@ -1,4 +1,4 @@
-use super::crypto::{read_encrypt_event, CryptoContext};
+use super::crypto::{read_rmux_event, CryptoContext};
 use super::event::{
     get_event_type_str, new_ping_event, new_pong_event, new_routine_event, new_shutdown_event,
     new_syn_event, new_window_update_event, Event, FLAG_DATA, FLAG_FIN, FLAG_PING, FLAG_PONG,
@@ -6,10 +6,11 @@ use super::event::{
 };
 use super::message::ConnectRequest;
 use super::stream::MuxStream;
+use super::DEFAULT_RECV_BUF_SIZE;
 use crate::channel::get_channel_stream;
 use crate::channel::ChannelStream;
 use crate::tunnel::relay;
-use crate::utils::{make_io_error, VBuf};
+use crate::utils::{clear_channel, make_io_error, VBuf};
 use bytes::BytesMut;
 use futures::future::join3;
 use futures::FutureExt;
@@ -19,7 +20,7 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -236,7 +237,7 @@ pub async fn routine_all_sessions() {
     }
     for action in actions.iter_mut() {
         let ev = action.ev.take().unwrap();
-        let _ = action.sender.send(ev).await;
+        let _ = action.sender.try_send(ev);
     }
 }
 
@@ -503,7 +504,10 @@ fn handle_routine_event(
         .unwrap()
         .as_secs() as u32;
     let idle_io_secs = session_state.get_io_idle_secs(now_unix_secs);
-    //let idle_io_secs = log_session_state(sid, streams, now_unix_secs, &session_state);
+    let mut stat_info = log_session_state(sid, now_unix_secs, &session_state);
+    stat_info.push_str(get_streams_stat_info(streams).as_str());
+    stat_info.push_str(format!("Streams:{}\n", streams.len()).as_str());
+    info!("{}", stat_info);
     let should_close = (session_state.is_retired() && streams.is_empty()) || idle_io_secs >= 300;
 
     if should_close {
@@ -676,7 +680,8 @@ async fn process_event<'a>(
     for (_, stream) in streams.iter_mut() {
         let _ = stream.close();
     }
-    event_rx.close();
+    clear_channel(&mut event_rx);
+
     let _ = send_tx.send(Vec::new()).await;
     session_state.process_event_state.store(6, Ordering::SeqCst);
 }
@@ -687,7 +692,6 @@ pub struct MuxContext<'a> {
     rctx: CryptoContext,
     wctx: CryptoContext,
     max_alive_secs: u64,
-    recv_buf: &'a mut BytesMut,
 }
 impl<'a> MuxContext<'a> {
     pub fn new(
@@ -696,7 +700,6 @@ impl<'a> MuxContext<'a> {
         rctx: CryptoContext,
         wctx: CryptoContext,
         max_alive_secs: u64,
-        recv_buf: &'a mut BytesMut,
     ) -> Self {
         Self {
             channel,
@@ -704,32 +707,24 @@ impl<'a> MuxContext<'a> {
             rctx,
             wctx,
             max_alive_secs,
-            recv_buf,
         }
     }
 }
 
 pub async fn process_rmux_session<'a, R, W>(
     ctx: MuxContext<'a>,
-    // channel: &str,
-    // tunnel_id: u32,
     ri: &'a mut R,
     wi: &'a mut W,
-    // mut rctx: CryptoContext,
-    // mut wctx: CryptoContext,
-    // recv_buf: &mut BytesMut,
-    // max_alive_secs: u64,
     relay_buf_size: usize,
 ) -> Result<(), std::io::Error>
 where
-    R: AsyncRead + Unpin + Sized,
+    R: AsyncBufRead + Unpin + Sized,
     W: AsyncWrite + Unpin + Sized,
 {
     let channel = ctx.channel;
     let tunnel_id = ctx.tunnel_id;
     let mut rctx = ctx.rctx;
     let wctx = ctx.wctx;
-    let recv_buf = ctx.recv_buf;
     let max_alive_secs = ctx.max_alive_secs;
     let (mut event_tx, event_rx) = mpsc::channel::<Event>(16);
     let (send_tx, mut send_rx) = mpsc::channel(16);
@@ -776,9 +771,9 @@ where
     let handle_recv = async move {
         while !handle_recv_session_state.closed.load(Ordering::SeqCst) {
             tokio::select! {
-                recv_event = read_encrypt_event(&mut rctx, ri, recv_buf) => {
+                recv_event = read_rmux_event(&mut rctx, ri) => {
                     match recv_event {
-                        Ok(Some(mut ev)) => {
+                        Ok(mut ev) => {
                             recv_session_state.io_active_unix_secs.store(
                                 SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
@@ -804,12 +799,7 @@ where
                                 break;
                             }
                         }
-                        Ok(None) => {
-                            //handle_recv_session_state.closed.store(true, Ordering::SeqCst);
-                            break;
-                        }
                         Err(err) => {
-                            //handle_recv_session_state.closed.store(true, Ordering::SeqCst);
                             error!("Close remote recv since of error:{}", err);
                             break;
                         }
@@ -831,6 +821,7 @@ where
         //let shutdown_ev = new_shutdown_event(0, false);
         //let _ = handle_recv_event_tx.send(shutdown_ev).await;
         let _ = handle_recv_send_tx.send(Vec::new()).await;
+        clear_channel(&mut close_rx);
         handle_recv_session_state
             .process_recv_state
             .store(2, Ordering::SeqCst);
@@ -929,7 +920,7 @@ where
         handle_send_session_state
             .closed
             .store(true, Ordering::SeqCst);
-        send_rx.close();
+        clear_channel(&mut send_rx);
         let close_rc = close_tx.send(()).await;
         if close_rc.is_err() {
             error!("[{}][{}]Close error:{:?}", channel, tunnel_id, close_rc);
@@ -953,17 +944,17 @@ pub async fn handle_rmux_session(
     mut inbound: TcpStream,
     rctx: CryptoContext,
     wctx: CryptoContext,
-    recv_buf: &mut BytesMut,
     max_alive_secs: u64,
     relay_buf_size: usize,
     //cfg: &TunnelConfig,
 ) -> Result<(), std::io::Error> {
-    let (mut ri, mut wi) = inbound.split();
-    let ctx = MuxContext::new(channel, tunnel_id, rctx, wctx, max_alive_secs, recv_buf);
+    let (ri, mut wi) = inbound.split();
+    let mut buf_reader = tokio::io::BufReader::with_capacity(DEFAULT_RECV_BUF_SIZE, ri);
+    let ctx = MuxContext::new(channel, tunnel_id, rctx, wctx, max_alive_secs);
     process_rmux_session(
         ctx, // channel,
         // tunnel_id,
-        &mut ri,
+        &mut buf_reader,
         &mut wi,
         // rctx,
         // wctx,
