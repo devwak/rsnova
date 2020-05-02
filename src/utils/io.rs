@@ -53,6 +53,9 @@ impl RelayState {
     }
 
     pub fn pending_elapsed(&self) -> Duration {
+        if self.shutdown {
+            return Duration::from_secs(std::u32::MAX as u64);
+        }
         match self.pending_timestamp {
             Some(v) => v.elapsed().unwrap(),
             None => Duration::from_secs(0),
@@ -102,7 +105,7 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         loop {
-            let _ = self.state.lock().unwrap().clear_waker();
+            self.state.lock().unwrap().clear_waker();
             if self.state.lock().unwrap().shutdown {
                 return Poll::Ready(Ok(self.amt));
             }

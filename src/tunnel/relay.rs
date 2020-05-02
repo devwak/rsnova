@@ -6,12 +6,15 @@ use crate::utils::{make_error, relay_buf_copy, RelayState};
 use futures::future::join3;
 use std::error::Error;
 use std::net::Shutdown;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time;
 use tokio::time::delay_for;
+
+// static RELAYS: AtomicU32 = AtomicU32::new(0);
 
 pub async fn relay_connection(
     tunnel_id: u32,
@@ -54,25 +57,44 @@ where
         return Err(make_error("no valid channel found."));
     }
 
-    let remote_target = String::from(target.as_str());
-    let mut remote = get_channel_stream(channel, target).await?;
+    //let remote_target = String::from(target.as_str());
+    // RELAYS.fetch_add(1, Ordering::SeqCst);
+    // info!(
+    //     "[{}][{}]Stream open with curent relay:{}",
+    //     tunnel_id,
+    //     remote_target,
+    //     RELAYS.load(Ordering::SeqCst)
+    // );
+    let mut remote = match get_channel_stream(channel, target).await {
+        Ok(s) => s,
+        Err(e) => {
+            //RELAYS.fetch_sub(1, Ordering::SeqCst);
+            return Err(make_error(&e.to_string()));
+        }
+    };
     {
         let (mut ro, mut wo) = remote.split();
-        if !relay_buf.is_empty() {
-            wo.write_all(&relay_buf[..]).await?;
+        let no_relay = !relay_buf.is_empty() && wo.write_all(&relay_buf[..]).await.is_err();
+        if !no_relay {
+            let _ = relay(
+                tunnel_id,
+                local_reader,
+                local_writer,
+                &mut ro,
+                &mut wo,
+                cfg.relay_buf_size(),
+            )
+            .await;
         }
-        relay(
-            tunnel_id,
-            local_reader,
-            local_writer,
-            &mut ro,
-            &mut wo,
-            cfg.relay_buf_size(),
-        )
-        .await?;
     }
     let _ = remote.close();
-    info!("[{}][{}]Stream close", tunnel_id, remote_target);
+    // RELAYS.fetch_sub(1, Ordering::SeqCst);
+    // info!(
+    //     "[{}][{}]Stream close with curent relay:{}",
+    //     tunnel_id,
+    //     remote_target,
+    //     RELAYS.load(Ordering::SeqCst)
+    // );
     Ok(())
 }
 
